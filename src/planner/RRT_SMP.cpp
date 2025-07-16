@@ -4,21 +4,21 @@
 
 
 //! EQUATIONS
-// // Eq 1: Size of branches area
-// double area(double DeltaT)
-// {
-//     return 2 * std::pow((DeltaT * 100 * 20) * 2,      // nstep *vmax
-//                         std::cos(DeltaT * 100 * 30)); // nstep + wmax
-// }
+// Eq 1: Size of branches area
+double area(double dt, double step, double vmax, double wmax)
+ {
+     return 2 * std::pow(dt * vmax * step,2.0) * std::cos(dt *wmax*step);
+ }
 
 // Extra: Obtain the relative config between init and goal
 
-std::tuple<double, double> getRelativeConfigINIT(double Xgoal, double robot_x, double Ygoal, double robot_y)
+std::tuple<double, double> getRelativeConfigINIT(nav_msgs::msg::Odometry::SharedPtr odom_data, std::vector<double> goal_point)
 {
-    double dx = Xgoal - robot_x;
-    double dy = Ygoal - robot_y;
-    double dGr = std::sqrt(dx * dx + dy * dy);
-    double thetaGr = std::atan2(dy, dx)*180/3.14;
+    double odom_x; double odom_y; double odom_z; double goal_x; double goal_y; double goal_z;
+
+    double dGr = std::sqrt(std::pow(goal_x - odom_x, 2) + std::pow(goal_y - odom_y, 2));
+
+    double thetaGr = std::atan2(goal_y - odom_y, goal_x - odom_x);
 
     return std::make_tuple(dGr, thetaGr);
 }
@@ -95,42 +95,63 @@ double getPeopleIntent(double Vpr, double dpr, double DeltaP)
 
 
 
-std::tuple<double, double> getVelocityMeans(double Fg, double Fp, double thetaG, double thetaP)
+std::tuple<double, double> getVelocityMeans(double Fg, double Fp, double thetaG, double thetaP, double max_v, double max_w)
 {
     //Eq 6 & 7
-    double max_v = 0.4, max_w = 0.4; 
-    double Mg = 100.0, Mp = 100.0;
-    double nF = 2; //Number of forces
+    double Mg = 1, Mp = 1, nF = 2;
 
-    double denominator_v_goal = 1.0 + std::exp(-5.0 * Fg /Mg)*std::cos(thetaG); //goal force, linear vel denominator
-    double denominator_w_goal = 1.0 + std::exp(-5.0 * Fg /Mg)*std::sin(thetaG); //goal force, angular vel denominator
-    double denominator_v_person = 1.0 + std::exp(-5.0 * Fp /Mp)*std::cos(thetaP); //person force, linear vel denominator
-    double denominator_w_person = 1.0 + std::exp(-5.0 * Fp /Mp)*std::sin(thetaP); //person force, angular vel denominator
-    double numerator_v_goal = 40.0 ;
+    double denominator_v_goal = 1.0 + std::exp(-5.0 * Fg /Mg)*std::cos(thetaG); 
+    double denominator_w_goal = 1.0 + std::exp(-5.0 * Fg /Mg)*std::sin(thetaG);
+    double denominator_v_person = 1.0 + std::exp(-5.0 * Fp /Mp)*std::cos(thetaP); 
+    double denominator_w_person = 1.0 + std::exp(-5.0 * Fp /Mp)*std::sin(thetaP); 
+    double numerator_goal = Mg/nF;
+    double numerator_person = Mp/nF;
 
-    double v_mean = max_v  / nF; // vmax
-    double w_mean = max_w/nF; // wmax
+    double v_mean = (max_v  / nF)*(1/denominator_v_goal + 1/denominator_v_goal);
+    double w_mean = (max_w/nF)*(1/denominator_w_goal + 1/denominator_w_person);
 
     return std::make_tuple(v_mean, w_mean);
 }
 
 //! LINEA 16 TO 25 ARE FOR MOTION PRIMITIVES GENERATION
-double mpDistribution(double mean, double delta, double offset)
+std::vector<double> mpDistribution(double mean, double sigma, int num_samples, double delta)
 {
-    // Genera un valor modulado entre [mean - delta, mean + delta]
-    double sampled_value = mean + offset;
+    std::vector<double> samples;
+    int half = num_samples/2;
+    
+    for (int i = -half; i <= half; ++i) {
 
-    // Clamp el valor para que no se salga del rango permitido
-    double lower_bound = mean - delta;
-    double upper_bound = mean + delta;
-
-    if (sampled_value < lower_bound)
-        sampled_value = lower_bound;
-    else if (sampled_value > upper_bound)
-        sampled_value = upper_bound;
-
-    return sampled_value;
+        samples.push_back(mean + i * delta);
+    }
+    return samples;
 }
+
+std::vector<std::pair<double,double>> MPgeneration(double v, double omega, double T, double dt,double A) // This "A" variable derives from "area" function
+{
+    std::vector<std::pair<double,double>> trajectory;
+    //In this point the initial point is suppose as the origin.
+    double x=0.0, y=0.0, theta=0.0;
+
+    for(double t=0.0; t<T; t+=dt)
+    {
+        if(std::abs(omega<1e-6))
+        {
+            x+=v*dt*std::cos(theta);
+            y+=v*dt*std::sin(theta);
+
+        }else{
+            double r=v/omega;
+
+            x+=r*(std::sin(theta+(omega*dt))-std::sin(theta));
+            y+=r*(std::cos(theta+(omega*dt))-std::cos(theta));
+
+            theta+=omega*dt;
+        }
+        trajectory.emplace_back(x,y);
+    }
+    return trajectory;
+}
+
 
 Pose2D convertVelocitytoArc(const Pose2D &startPose, double v, double omega, double dt)
 {

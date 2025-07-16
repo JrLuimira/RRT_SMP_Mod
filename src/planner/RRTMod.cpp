@@ -48,12 +48,16 @@ ompl::geometric::RRTMod::RRTMod(const base::SpaceInformationPtr &si,
                                 std::vector<double> &angular_vel_vector,
                                 std::vector<double> &distances_vector,
                                 std::vector<double> &angle_vector,
+                                std::vector<double> &goal_point,
+                                nav_msgs::msg::Odometry::SharedPtr odom_data,
                                 bool addIntermediateStates)
     : base::Planner(si, addIntermediateStates ? "RRTintermediate" : "RRTMod"),
       linear_vel_vector_(linear_vel_vector),
       angular_vel_vector_(angular_vel_vector),
       distances_vector_(distances_vector),
-      angle_vector_(angle_vector)
+      angle_vector_(angle_vector),
+      goal_point_(goal_point),
+      odom_data_(odom_data)
 {
     specs_.approximateSolutions = true;
     specs_.directed = true;
@@ -65,6 +69,7 @@ ompl::geometric::RRTMod::RRTMod(const base::SpaceInformationPtr &si,
     addIntermediateStates_ = addIntermediateStates;
 }
 
+// Destructor definition
 ompl::geometric::RRTMod::~RRTMod()
 {
     freeMemory();
@@ -112,6 +117,11 @@ nav_msgs::msg::Path *ompl::geometric::RRTMod::simulateArcStep(
     const ompl::base::State *to,
     double v, double w, double dt)
 {
+
+    //! Motion primitives array B = [[vi,wi,]...]
+    // p_linear_velocities = {-8.0, -4.0, -1.0, 0.0, 1.0, 4.0, 8.0};
+    // mp_angular_velocities = {-4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0};
+
     if (!from || !to)
     {
         OMPL_ERROR("simulateArcStep: One of the states is null.");
@@ -128,31 +138,64 @@ nav_msgs::msg::Path *ompl::geometric::RRTMod::simulateArcStep(
         return nullptr;
     }
 
+    // Default or fixed number of points
+    double max_linear_vel = *std::max_element(mp_linear_velocities.begin(), mp_linear_velocities.end());
+    double max_angular = *std::max_element(mp_angular_velocities.begin(), mp_angular_velocities.end());
+    int num_points = 24;
+    
+    double A = area(dt, num_points, max_linear_vel, max_angular); //! NOT USING THIS VALUE YET
+
     double x = fromSE2->getX();
     double y = fromSE2->getY();
-    double theta = fromSE2->getYaw();
 
+    double theta = fromSE2->getYaw();
     auto *path_msg = new nav_msgs::msg::Path();
-    int num_points = 3; // Default or fixed number of points
     path_msg->poses.reserve(num_points);
 
-    for (int i = 0; i < num_points; ++i)
+    linear_gaussian = mpDistribution(max_linear_vel, 0.2, num_points, 0.1); // Linear distribution
+    omega_gaussian = mpDistribution(max_angular, 0.2, num_points, 0.1);     // Angular distribution
+
+    for (double linear : linear_gaussian)
     {
-        geometry_msgs::msg::PoseStamped pose;
-        pose.pose.position.x = x;
-        pose.pose.position.y = y;
-        pose.pose.position.z = 0.0;
+        for (double angular : omega_gaussian)
+        {
+            for (int i = 0.0; i <= 1.0; i += dt)
+            {
+                for (double t = 0.0; t < 1.0; t += dt)
+                {
+                    if (std::abs(angular) < 1e-6)
+                    {
+                        x += linear * dt * std::cos(theta);
+                        y += linear * dt * std::sin(theta);
+                    }
+                    else
+                    {
+                        double r = linear / angular;
+                        x += r * (std::sin(theta + angular * dt) - std::sin(theta));
+                        y += -r * (std::cos(theta + angular * dt) - std::cos(theta));
+                        theta += angular * dt;
+                    }
+                    geometry_msgs::msg::PoseStamped pose;
+                    pose.pose.position.x = x;
+                    pose.pose.position.y = y;
+                    pose.pose.position.z = 0.0;
 
-        tf2::Quaternion q;
-        q.setRPY(0, 0, theta);
-        pose.pose.orientation = tf2::toMsg(q);
+                    tf2::Quaternion q;
+                    q.setRPY(0, 0, theta);
+                    pose.pose.orientation = tf2::toMsg(q);
 
-        path_msg->poses.push_back(pose);
+                    path_msg->poses.push_back(pose);
 
-        // Simular siguiente paso
-        x += v * std::cos(theta) * dt;
-        y += v * std::sin(theta) * dt;
-        theta += w * dt;
+                    // Simular siguiente paso
+                    // x += v * std::cos(theta) * dt;
+                    // y += v * std::sin(theta) * dt;
+                    // theta += w * dt;
+                    OMPL_INFORM("x: %f", x);
+                    OMPL_INFORM("y: %f", y);
+                    OMPL_INFORM("theta: %f", theta);
+                }
+            }
+        }
     }
 
     return path_msg;
@@ -180,8 +223,6 @@ ompl::base::PlannerStatus ompl::geometric::RRTMod::solve(const base::PlannerTerm
 {
     checkValidity();
     base::Goal *goal = pdef_->getGoal().get();
-    OMPL_INFORM("NECESITO SABER QUE TIRO ESE GOAL");
-    OMPL_INFORM("Goal pointer address: %p", static_cast<void*>(goal));
     auto *goal_s = dynamic_cast<base::GoalSampleableRegion *>(goal);
 
     while (const base::State *st = pis_.nextStart())
@@ -208,13 +249,13 @@ ompl::base::PlannerStatus ompl::geometric::RRTMod::solve(const base::PlannerTerm
     auto *rmotion = new Motion(si_);
     base::State *rstate = rmotion->state;
     base::State *xstate = si_->allocState();
-    //!NEED TO GET THE INIT POS AND GOAL POS
+    //! NEED TO GET THE INIT POS AND GOAL POS
 
-    getInitialConfig_value = getRelativeConfig(distances_vector_,angle_vector_ ,-4.0, 5.0);
+    getInitialConfig_value = getRelativeConfig(distances_vector_, angle_vector_, -4.0, 5.0);
     double d_Initial = std::get<0>(getInitialConfig_value);
     double theta_Initial = std::get<1>(getInitialConfig_value);
-    OMPL_INFORM("Initial distance is: %f", d_Initial);
-    OMPL_INFORM("Initial angle is: %f", theta_Initial);
+    // OMPL_INFORM("Initial distance is: %f", d_Initial);
+    // OMPL_INFORM("Initial angle is: %f", theta_Initial);
 
     //! Here the RRT_SMP starts
     while (!ptc)
@@ -237,70 +278,57 @@ ompl::base::PlannerStatus ompl::geometric::RRTMod::solve(const base::PlannerTerm
         // OMPL_INFORM("Current angle is: %f", theta_config);
 
         // FG force
-        getGoalIntent_value = getGoalIntent(d_Initial, theta_Initial, 60.0, 1.0);
+        getGoalIntent_value = getGoalIntent(d_Initial, theta_Initial, 2, 0.0);
         double FG_value = std::get<0>(getGoalIntent_value);
         double ThetaG_value = std::get<1>(getGoalIntent_value);
-        OMPL_INFORM("Force Goal is: %f", FG_value);
-        OMPL_INFORM("Angle force is: %f", ThetaG_value);
-        OMPL_INFORM("Antes de guardas las fuerzas");
+        // OMPL_INFORM("Force Goal is: %f", FG_value);
+        // OMPL_INFORM("Angle force is: %f", ThetaG_value);
+        // OMPL_INFORM("Antes de guardas las fuerzas");
         /* find closest state in the tree */
-        OMPL_INFORM("ANTES DE MOTION");
+        // OMPL_INFORM("ANTES DE MOTION");
         Motion *nmotion = nn_->nearest(rmotion);
-       
+
         /* find state to add */
 
         //! En esta parte da error: I dont know why
 
         //! Here is validated all the peredastian config available
         //! For cycle, line 6 code
-        OMPL_INFORM("DESPUES DE BASE");
+        // OMPL_INFORM("DESPUES DE BASE");
 
         pederastianVector_value = calculateRelativeConfigPPL(linear_vel_vector_, angular_vel_vector_, distances_vector_, angle_vector_);
 
-        //OMPL_INFORM("DESPUES DE llamar a la funcion de pederastian");
+        // OMPL_INFORM("DESPUES DE llamar a la funcion de pederastian");
 
         double total_vel_lin = pederastianVector_value[0];
-        OMPL_INFORM("Primer valor");
+        // OMPL_INFORM("Primer valor");
         double total_distance = pederastianVector_value[2];
-        OMPL_INFORM("Segundo valor");
+        // OMPL_INFORM("Segundo valor");
         double total_angle = pederastianVector_value[3];
-        OMPL_INFORM("------Now the pederastian values-------");
-        OMPL_INFORM("Linear velocity: %f", total_vel_lin);
-        OMPL_INFORM("Distance: %f", total_distance);
-        OMPL_INFORM("Angle: %f", total_angle);
+        // OMPL_INFORM("------Now the pederastian values-------");
+        // OMPL_INFORM("Linear velocity: %f", total_vel_lin);
+        // OMPL_INFORM("Distance: %f", total_distance);
+        // OMPL_INFORM("Angle: %f", total_angle);
 
         getPeopleIntent_value = getPeopleIntent(total_vel_lin, total_distance, total_angle); // FP force
 
         getVelocityMeans_value = getVelocityMeans(FG_value, getPeopleIntent_value, ThetaG_value, total_angle);
         double v_mean = std::get<0>(getVelocityMeans_value);
         double w_mean = std::get<1>(getVelocityMeans_value);
-        OMPL_INFORM("--------- The velocities of SMP --------------");
-        OMPL_INFORM("Velocity mean: %f", v_mean);
-        OMPL_INFORM("Angular mean: %f", w_mean);
-
-        double x1 = nmotion->state->as<ompl::base::SE2StateSpace::StateType>()->getX();
-        //OMPL_INFORM("OH YE");
-        double y1 = nmotion->state->as<ompl::base::SE2StateSpace::StateType>()->getY();
-        //OMPL_INFORM("OH YE");
-        double theta1 = nmotion->state->as<ompl::base::SE2StateSpace::StateType>()->getYaw();
-        //OMPL_INFORM("OH YE");
-        double x2 = rstate->as<ompl::base::SE2StateSpace::StateType>()->getX();
-        //OMPL_INFORM("OH YE");
-        double y2 = rstate->as<ompl::base::SE2StateSpace::StateType>()->getX();
-        //OMPL_INFORM("OH YE");
+        // OMPL_INFORM("--------- The velocities of SMP --------------");
+        // OMPL_INFORM("Velocity mean: %f", v_mean);
+        // OMPL_INFORM("Angular mean: %f", w_mean);
 
         //  nmotion->state->as<ompl::base::SE2StateSpace::StateType>(),
         //     rstate->as<ompl::base::SE2StateSpace::StateType>(),
         std::string spaceName = si_->getStateSpace()->getName();
         OMPL_INFORM("State space name: %s", spaceName.c_str());
-        OMPL_INFORM("work1?");
-
         valid_arc_points = simulateArcStep(
             nmotion->state,
             rstate,
             v_mean,
             w_mean,
-            0.1);
+            1.0);
 
         // double d = si_->distance(nmotion->state, rstate); // current
 
@@ -309,13 +337,13 @@ ompl::base::PlannerStatus ompl::geometric::RRTMod::solve(const base::PlannerTerm
         //     si_->getStateSpace()->interpolate(nmotion->state, rstate, maxDistance_ / d, xstate);
         //     dstate = xstate;
         // }
-        OMPL_INFORM("Sigue00?");
 
         //! This part is for checking collision of the curve
         // Iterate over each pose in the simulated arc path
         for (const auto &pose_stamped : valid_arc_points->poses)
         {
-            OMPL_INFORM("Sigue?");
+
+            OMPL_INFORM("Si corre ");
 
             // Convert pose_stamped to SE2 state
             double aux1 = pose_stamped.pose.position.x;
@@ -326,7 +354,6 @@ ompl::base::PlannerStatus ompl::geometric::RRTMod::solve(const base::PlannerTerm
 
             if (si_->checkMotion(nmotion->state, new_intermediate_state_curve))
             {
-                OMPL_INFORM("Sigue2");
                 if (addIntermediateStates_)
                 {
 
@@ -335,7 +362,6 @@ ompl::base::PlannerStatus ompl::geometric::RRTMod::solve(const base::PlannerTerm
 
                     if (si_->getMotionStates(nmotion->state, new_intermediate_state_curve, states, count, true, true))
                         si_->freeState(states[0]);
-                    OMPL_INFORM("Sigue3");
                     for (std::size_t i = 1; i < states.size(); ++i)
                     {
                         auto *motion = new Motion;
@@ -345,7 +371,6 @@ ompl::base::PlannerStatus ompl::geometric::RRTMod::solve(const base::PlannerTerm
                         nn_->add(motion);
 
                         nmotion = motion;
-                        
                     }
                 }
                 else
@@ -354,29 +379,20 @@ ompl::base::PlannerStatus ompl::geometric::RRTMod::solve(const base::PlannerTerm
                     si_->copyState(motion->state, new_intermediate_state_curve);
                     motion->parent = nmotion;
                     nn_->add(motion);
-                    OMPL_INFORM("Sigue3");
                     nmotion = motion;
-                    OMPL_INFORM("Sigue4");
-                    //! AQUI SE MUERE EL CODIGO
-
-
                 }
-                OMPL_INFORM("Sigue4.1");
+
                 double dist = 0.0;
                 bool sat = goal->isSatisfied(nmotion->state, &dist);
-                OMPL_INFORM("Sigue4.2");
                 if (sat)
-                {   
-                    OMPL_INFORM("Sigue4.3");
+                {
                     approxdif = dist;
-                    OMPL_INFORM("Sigue4.4");
                     solution = nmotion;
 
                     break;
                 }
                 if (dist < approxdif)
                 {
-                    OMPL_INFORM("Sigue4.5");
                     approxdif = dist;
                     approxsol = nmotion;
                 }
@@ -386,7 +402,6 @@ ompl::base::PlannerStatus ompl::geometric::RRTMod::solve(const base::PlannerTerm
 
     bool solved = false;
     bool approximate = false;
-    OMPL_INFORM("Sigue5");
 
     if (solution == nullptr)
     {
@@ -414,7 +429,6 @@ ompl::base::PlannerStatus ompl::geometric::RRTMod::solve(const base::PlannerTerm
         solved = true;
     }
 
-
     si_->freeState(xstate);
     if (rmotion->state != nullptr)
         si_->freeState(rmotion->state);
@@ -424,7 +438,7 @@ ompl::base::PlannerStatus ompl::geometric::RRTMod::solve(const base::PlannerTerm
 
     return {solved, approximate};
     //! Free the memory
-    delete valid_arc_points;
+    // delete valid_arc_points;
 }
 
 void ompl::geometric::RRTMod::getPlannerData(base::PlannerData &data) const
